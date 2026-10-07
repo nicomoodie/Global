@@ -1,0 +1,4 @@
+# property photos stay local: this repo is public
+photo-enhance/input/
+photo-enhance/output/
+__pycache__/
