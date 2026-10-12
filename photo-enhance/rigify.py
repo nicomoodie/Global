@@ -83,6 +83,9 @@ def main():
     ap.add_argument('--fps', type=int, default=24)
     ap.add_argument('--sigma', type=float, default=18.0, help='path smoothing, frames')
     ap.add_argument('--ease', type=float, default=0.12, help='share of ease-in/out at each end')
+    ap.add_argument('--path', choices=['smooth', 'rail'], default='smooth',
+                    help="rail: fit a low-order curve to the camera path (no oscillation at all)")
+    ap.add_argument('--degree', type=int, default=2, help='rail curve degree')
     a = ap.parse_args()
 
     steps, w, h = step_transforms(a.src)
@@ -90,7 +93,12 @@ def main():
     for M in steps[1:]:
         C.append(M @ C[-1])
     P = np.array([params(c) for c in C])
-    S = np.column_stack([gauss_smooth(P[:, j], a.sigma) for j in range(4)])
+    if a.path == 'rail':
+        t = np.arange(len(P))
+        S = np.column_stack([np.polyval(np.polyfit(t, P[:, j], a.degree), t) for j in range(4)])
+        S[:, 2] = 0.0  # lock roll: the horizon never tilts
+    else:
+        S = np.column_stack([gauss_smooth(P[:, j], a.sigma) for j in range(4)])
     W = [matrix(S[i]) @ np.linalg.inv(C[i]) for i in range(len(C))]
     z = cover_zoom(W, w, h)
 
