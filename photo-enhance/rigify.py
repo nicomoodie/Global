@@ -83,9 +83,12 @@ def main():
     ap.add_argument('--fps', type=int, default=24)
     ap.add_argument('--sigma', type=float, default=18.0, help='path smoothing, frames')
     ap.add_argument('--ease', type=float, default=0.12, help='share of ease-in/out at each end')
-    ap.add_argument('--path', choices=['smooth', 'rail'], default='smooth',
-                    help="rail: fit a low-order curve to the camera path (no oscillation at all)")
+    ap.add_argument('--path', choices=['smooth', 'rail', 'fep'], default='fep',
+                    help="fep: one straight rail = zoom about a single fixed expansion point, roll "
+                         "locked, smooth scale (removes bob, sway, weave, banking); "
+                         "rail/smooth: older per-parameter fits")
     ap.add_argument('--degree', type=int, default=2, help='rail curve degree')
+    ap.add_argument('--no-retime', action='store_true', help='keep original timing (frame i -> frame i)')
     a = ap.parse_args()
 
     steps, w, h = step_transforms(a.src)
@@ -93,19 +96,38 @@ def main():
     for M in steps[1:]:
         C.append(M @ C[-1])
     P = np.array([params(c) for c in C])
-    if a.path == 'rail':
+    if a.path == 'fep':
+        # A camera on one straight rail (any direction, fixed orientation) moves image content
+        # as a pure zoom about ONE fixed point F (the focus of expansion). Fit F to the whole
+        # clip, smooth the scale, and warp every frame onto that ideal move.
+        Ca = np.array(C)
+        c = np.array([w / 2, h / 2, 1.0])
+        s_raw = np.hypot(Ca[:, 0, 0], Ca[:, 1, 0])
+        u = (Ca @ c)[:, :2] - c[:2]
+        e = (s_raw - 1)[:, None]
+        g = (e * u).sum(0) / max(float((e * e).sum()), 1e-12)
+        F = c[:2] - g
+        ls = gauss_smooth(np.log(s_raw), a.sigma)
+        ls = np.maximum.accumulate(ls) if ls[-1] >= ls[0] else np.minimum.accumulate(ls)
+        sm = np.exp(ls)
+        T = [np.array([[k, 0, F[0] * (1 - k)], [0, k, F[1] * (1 - k)], [0, 0, 1]]) for k in sm]
+        W = [T[i] @ np.linalg.inv(C[i]) for i in range(len(C))]
+        z = cover_zoom(W, w, h)
+        speed = np.abs(np.diff(ls)) + 1e-9
+        print(f'fep: expansion point F = ({F[0] / w:.3f}W, {F[1] / h:.3f}H), total zoom {sm[-1]:.3f}')
+    elif a.path == 'rail':
         t = np.arange(len(P))
         S = np.column_stack([np.polyval(np.polyfit(t, P[:, j], a.degree), t) for j in range(4)])
         S[:, 2] = 0.0  # lock roll: the horizon never tilts
     else:
         S = np.column_stack([gauss_smooth(P[:, j], a.sigma) for j in range(4)])
-    W = [matrix(S[i]) @ np.linalg.inv(C[i]) for i in range(len(C))]
-    z = cover_zoom(W, w, h)
-
-    # apparent speed along the smoothed path: translation + zoom seen at the frame corner
-    half_diag = np.hypot(w, h) / 2
-    d = np.diff(S, axis=0)
-    speed = np.hypot(d[:, 0], d[:, 1]) + half_diag * np.abs(d[:, 3]) + half_diag * np.abs(d[:, 2])
+    if a.path != 'fep':
+        W = [matrix(S[i]) @ np.linalg.inv(C[i]) for i in range(len(C))]
+        z = cover_zoom(W, w, h)
+        # apparent speed along the smoothed path: translation + zoom seen at the frame corner
+        half_diag = np.hypot(w, h) / 2
+        d = np.diff(S, axis=0)
+        speed = np.hypot(d[:, 0], d[:, 1]) + half_diag * np.abs(d[:, 3]) + half_diag * np.abs(d[:, 2])
     prog = np.concatenate([[0], np.cumsum(speed)])
     prog /= prog[-1]
 
@@ -117,6 +139,9 @@ def main():
     tgt = np.where(u < e, (e / 2) * (u / e) ** 2, tgt)
     tgt = np.where(u > 1 - e, 1 - (e / 2) * ((1 - u) / e) ** 2, tgt)
     t_src = np.interp(tgt, prog, np.arange(len(prog)))
+    if a.no_retime:
+        n_out = len(prog)
+        t_src = np.arange(n_out, dtype=float)
 
     # output 16:9 at 1920x1080
     out_w, out_h = 1920, 1080

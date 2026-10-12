@@ -1,51 +1,77 @@
-"""Per-frame global camera motion (similarity transform) for a clip, plus jitter stats."""
+"""Bounce/sway QC that is not fooled by zoom, drift or speed ramps.
+
+Per frame: global similarity (LK + RANSAC, like motion.py) composed properly.
+Translation is measured at the image centre, then the part explained by a
+zoom about ONE fixed expansion point (= a straight rail in any direction) is
+removed by least squares. What is left is camera-path deviation from a rail.
+  sway_px / bob_px : peak |deviation| in the gait band (>~0.6 Hz), interior frames
+  rail_dev_px      : peak-to-peak deviation from the rail without high-pass
+                     (catches slow weaves and mid-clip height humps)
+  roll_deg         : peak |roll| (horizon tilt) relative to frame 0
+Usage: python3 -I motion_qc.py clip.mp4 [...]
+"""
 import sys, json
 import cv2, numpy as np
 
-def trajectory(path):
+
+def steps(path):
     cap = cv2.VideoCapture(path)
     ok, prev = cap.read()
-    prev_g = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
-    T = []  # dx, dy, da, ds per step
+    h, w = prev.shape[:2]
+    pg = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+    A = [np.eye(3)]
     while True:
-        ok, frame = cap.read()
+        ok, f = cap.read()
         if not ok:
             break
-        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        pts = cv2.goodFeaturesToTrack(prev_g, 400, 0.01, 20)
-        nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev_g, g, pts, None)
-        p0, p1 = pts[st == 1], nxt[st == 1]
-        M, _ = cv2.estimateAffinePartial2D(p0, p1, method=cv2.RANSAC)
-        dx, dy = M[0, 2], M[1, 2]
-        da = np.arctan2(M[1, 0], M[0, 0])
-        ds = np.hypot(M[0, 0], M[1, 0])
-        T.append((dx, dy, da, ds))
-        prev_g = g
-    return np.array(T)
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        p = cv2.goodFeaturesToTrack(pg, 600, 0.01, 15)
+        q, st, _ = cv2.calcOpticalFlowPyrLK(pg, g, p, None)
+        M, _ = cv2.estimateAffinePartial2D(p[st == 1], q[st == 1], method=cv2.RANSAC,
+                                           ransacReprojThreshold=2.0)
+        A.append(np.vstack([M, [0, 0, 1]]))
+        pg = g
+    return A, w, h
 
-def smooth(x, r):
-    k = np.ones(2 * r + 1) / (2 * r + 1)
-    xp = np.pad(x, r, mode='edge')
-    return np.convolve(xp, k, mode='valid')
 
-out = {}
-for path in sys.argv[1:]:
-    T = trajectory(path)
-    cum = np.cumsum(T[:, :3], axis=0)
-    zoom = np.cumprod(T[:, 3])
-    res = {}
-    for i, name in enumerate(['x_px', 'y_px', 'roll_rad']):
-        c = cum[:, i]
-        jitter = c - smooth(c, 12)  # remove motion slower than ~1 s
-        res[name] = dict(total=round(float(c[-1]), 2), jitter_rms=round(float(jitter.std()), 3),
-                         jitter_peak=round(float(np.abs(jitter).max()), 3))
-        if name == 'y_px':
-            sp = np.abs(np.fft.rfft(jitter - jitter.mean()))
-            f = np.fft.rfftfreq(len(jitter), 1 / 24)
-            res[name]['dominant_hz'] = round(float(f[1:][sp[1:].argmax()]), 2)
-    res['zoom_total'] = round(float(zoom[-1]), 4)
-    # speed profile: forward motion per second (zoom growth per 24 frames)
-    lz = np.log(zoom)
-    res['zoom_per_sec'] = [round(float(np.exp(lz[min(i + 23, len(lz) - 1)] - (lz[i - 1] if i else 0)) - 1), 4) for i in range(0, len(lz), 24)]
-    out[path.split('/')[-1]] = res
-print(json.dumps(out, indent=1))
+def hp(x, sigma=10.0):
+    """x minus a Gaussian trend; odd-reflect padding so ends keep their slope."""
+    r = int(3 * sigma)
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2); k /= k.sum()
+    xp = np.concatenate([2 * x[0] - x[r:0:-1], x, 2 * x[-1] - x[-2:-r - 2:-1]])
+    return x - np.convolve(xp, k, mode='valid')
+
+
+def analyse(path, fps=24):
+    A, w, h = steps(path)
+    C = [A[0]]
+    for M in A[1:]:
+        C.append(M @ C[-1])
+    C = np.array(C)
+    c = np.array([w / 2, h / 2, 1.0])
+    s = np.hypot(C[:, 0, 0], C[:, 1, 0])
+    th = np.arctan2(C[:, 1, 0], C[:, 0, 0])
+    u = (C @ c)[:, :2] - c[:2]                 # where the frame centre went
+    e = (s - 1)[:, None]
+    g = (e * u).sum(0) / max((e * e).sum(), 1e-12)   # u = (s-1)*(c-F): fit fixed F
+    F = c[:2] - g
+    r = u - e * g                              # deviation from a straight rail
+    m = slice(6, len(r) - 6)                   # drop 1/4 s at each end
+    out = {}
+    for i, name in ((0, 'sway_px'), (1, 'bob_px')):
+        j = hp(r[:, i])[m]
+        sp = np.abs(np.fft.rfft(j - j.mean())); fr = np.fft.rfftfreq(len(j), 1 / fps)
+        out[name] = round(float(np.abs(j).max()), 2)
+        out[name + '_hz'] = round(float(fr[1:][sp[1:].argmax()]), 2)
+        out['rail_dev_' + name[:-3] + '_pp'] = round(float(np.ptp(r[m, i])), 2)
+    out['roll_deg_peak'] = round(float(np.degrees(np.abs(th).max())), 3)
+    out['zoom_total'] = round(float(s[-1]), 4)
+    out['expansion_point_frac'] = [round(float(F[0] / w), 3), round(float(F[1] / h), 3)]
+    ls = np.log(s)
+    v = np.diff(ls) * fps
+    out['speed_cv_mid'] = round(float(v[len(v)//5:-len(v)//5].std() / max(abs(v[len(v)//5:-len(v)//5].mean()), 1e-9)), 3)
+    return out
+
+
+if __name__ == '__main__':
+    print(json.dumps({p.split('/')[-1]: analyse(p) for p in sys.argv[1:]}, indent=1))
