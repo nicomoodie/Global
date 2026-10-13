@@ -6,7 +6,7 @@
 4. Re-time so apparent motion runs at constant speed (soft ease at the ends),
    and speed the clip up to the requested output length.
 
-Usage: python3 -I rigify.py IN.mp4 OUT.mp4 --seconds 5 [--sigma 18]
+Usage: python3 -I rigify.py IN.mp4 OUT.mp4 --seconds 5 [--sigma 18] [--path fep|smooth|rail] [--ease 0]
 """
 import argparse
 import subprocess
@@ -82,13 +82,14 @@ def main():
     ap.add_argument('--seconds', type=float, default=5.0)
     ap.add_argument('--fps', type=int, default=24)
     ap.add_argument('--sigma', type=float, default=18.0, help='path smoothing, frames')
-    ap.add_argument('--ease', type=float, default=0.12, help='share of ease-in/out at each end')
+    ap.add_argument('--ease', type=float, default=0.12, help='share of ease-in/out at each end; 0 = constant speed (cut on motion)')
     ap.add_argument('--path', choices=['smooth', 'rail', 'fep'], default='fep',
                     help="fep: one straight rail = zoom about a single fixed expansion point, roll "
                          "locked, smooth scale (removes bob, sway, weave, banking); "
                          "rail/smooth: older per-parameter fits")
     ap.add_argument('--degree', type=int, default=2, help='rail curve degree')
     ap.add_argument('--no-retime', action='store_true', help='keep original timing (frame i -> frame i)')
+    ap.add_argument('--lock-roll', action='store_true', help='smooth path: hold roll at the first frame (level horizon)')
     a = ap.parse_args()
 
     steps, w, h = step_transforms(a.src)
@@ -121,6 +122,8 @@ def main():
         S[:, 2] = 0.0  # lock roll: the horizon never tilts
     else:
         S = np.column_stack([gauss_smooth(P[:, j], a.sigma) for j in range(4)])
+        if a.lock_roll:
+            S[:, 2] = 0.0
     if a.path != 'fep':
         W = [matrix(S[i]) @ np.linalg.inv(C[i]) for i in range(len(C))]
         z = cover_zoom(W, w, h)
@@ -135,9 +138,12 @@ def main():
     u = np.linspace(0, 1, n_out)
     # constant speed with a short smoothstep ease at both ends
     e = a.ease
-    tgt =np.interp(u, [0, e, 1 - e, 1], [0, e / 2, 1 - e / 2, 1])
-    tgt = np.where(u < e, (e / 2) * (u / e) ** 2, tgt)
-    tgt = np.where(u > 1 - e, 1 - (e / 2) * ((1 - u) / e) ** 2, tgt)
+    if e > 0:
+        tgt = np.interp(u, [0, e, 1 - e, 1], [0, e / 2, 1 - e / 2, 1])
+        tgt = np.where(u < e, (e / 2) * (u / e) ** 2, tgt)
+        tgt = np.where(u > 1 - e, 1 - (e / 2) * ((1 - u) / e) ** 2, tgt)
+    else:
+        tgt = u  # constant speed edge to edge: the shot is already moving when it cuts in and out
     t_src = np.interp(tgt, prog, np.arange(len(prog)))
     if a.no_retime:
         n_out = len(prog)
