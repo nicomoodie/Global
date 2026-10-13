@@ -90,6 +90,8 @@ def main():
     ap.add_argument('--degree', type=int, default=2, help='rail curve degree')
     ap.add_argument('--no-retime', action='store_true', help='keep original timing (frame i -> frame i)')
     ap.add_argument('--lock-roll', action='store_true', help='smooth path: hold roll at the first frame (level horizon)')
+    ap.add_argument('--speed', choices=['distance', 'logscale'], default='distance',
+                    help='fep re-timing: constant camera travel (distance) or constant zoom rate (logscale)')
     a = ap.parse_args()
 
     steps, w, h = step_transforms(a.src)
@@ -114,7 +116,13 @@ def main():
         T = [np.array([[k, 0, F[0] * (1 - k)], [0, k, F[1] * (1 - k)], [0, 0, 1]]) for k in sm]
         W = [T[i] @ np.linalg.inv(C[i]) for i in range(len(C))]
         z = cover_zoom(W, w, h)
-        speed = np.abs(np.diff(ls)) + 1e-9
+        if a.speed == 'distance':
+            # a dolly at constant velocity toward the scene: scale s = D/(D - v t), so the
+            # distance travelled is proportional to 1 - 1/s (relative to the first frame)
+            prog_d = 1 - sm[0] / sm
+            speed = np.abs(np.diff(prog_d)) + 1e-9
+        else:
+            speed = np.abs(np.diff(ls)) + 1e-9
         print(f'fep: expansion point F = ({F[0] / w:.3f}W, {F[1] / h:.3f}H), total zoom {sm[-1]:.3f}')
     elif a.path == 'rail':
         t = np.arange(len(P))
