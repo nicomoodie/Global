@@ -3,6 +3,8 @@
 For moves the dolly model in rigify.py does not describe (orbits, arcs, sweeping turns):
 per-frame speed = median optical-flow length of tracked features, then output frames are
 sampled at equal steps of accumulated motion (blending neighbouring source frames).
+--metric dense uses the mean dense (Farneback) flow over the whole frame, which follows perceived
+motion in orbits with strong parallax better than the median of sparse features.
 --metric travel is for forward dollies: per-frame expansion rate (median radial flow / radius
 about the frame centre) is integrated to log-scale L, and frames are sampled at equal steps of
 camera travel 1 - exp(-L), i.e. constant dolly speed.
@@ -25,8 +27,8 @@ ap.add_argument('--trim-start', type=int, default=0, help='source frames dropped
 ap.add_argument('--trim-end', type=int, default=0, help='source frames dropped at the end')
 ap.add_argument('--ease', type=float, default=0.0, help='share of ease-in/out at each end; 0 = constant speed')
 ap.add_argument('--smooth', type=float, default=4.0, help='gaussian sigma (frames) applied to the speed curve')
-ap.add_argument('--metric', choices=['flow', 'travel'], default='flow',
-                help='flow: constant on-screen motion (orbits, pans); travel: constant forward dolly speed')
+ap.add_argument('--metric', choices=['flow', 'dense', 'travel'], default='flow',
+                help='flow/dense: constant on-screen motion (orbits, pans); travel: constant forward dolly speed')
 a = ap.parse_args()
 
 cap = cv2.VideoCapture(a.src)
@@ -49,6 +51,9 @@ for f in frames[1:]:
         p1, st, _ = cv2.calcOpticalFlowPyrLK(prev, g, p0, None)
         ok = st.ravel() == 1
         speed.append(float(np.median(np.linalg.norm((p1[ok] - p0[ok]).reshape(-1, 2), axis=1))) if ok.sum() > 20 else 0.0)
+    elif a.metric == 'dense':
+        flow = cv2.calcOpticalFlowFarneback(prev, g, None, 0.5, 4, 21, 3, 5, 1.1, 0)
+        speed.append(float(np.linalg.norm(flow, axis=2).mean()))
     else:
         p0 = cv2.goodFeaturesToTrack(prev, 1000, 0.005, 6)
         p1, st, _ = cv2.calcOpticalFlowPyrLK(prev, g, p0, None, winSize=(21, 21), maxLevel=4)
@@ -104,4 +109,4 @@ enc.stdin.close()
 enc.wait()
 print(f'{a.src}: {len(frames)} src frames -> {n_out} out frames ({len(frames) / a.fps:.1f}s -> {a.seconds:.1f}s), '
       f'speed min/med/max {speed.min():.2f}/{np.median(speed):.2f}/{speed.max():.2f} '
-      f'{"px/frame" if a.metric == "flow" else "travel x1000/frame"}')
+      f'{"travel x1000/frame" if a.metric == "travel" else "px/frame"}')
